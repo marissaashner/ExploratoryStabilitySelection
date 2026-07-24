@@ -69,7 +69,7 @@ data_ltc_pi = data %>% filter(!is.na(IFNy)) %>%
 
 ```{r}
 # function to make the design matrix for the predictors
-# this is written for "standard LASSO" and not "group LASSO", meaning levels of variables will be considered by the penalization method separately and will not be tethered together                                                                                                                            
+# this is written for "standard LASSO" and not "group LASSO", meaning levels of variables will be considered by the penalization method separately and will not be tethered together                                    
 make_group_matrix <- function(
     data, # data frame
     response, # name of the outcome column

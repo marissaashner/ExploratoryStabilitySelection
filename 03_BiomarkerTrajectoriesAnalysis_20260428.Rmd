@@ -18,30 +18,9 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Purpose
 
-This script runs the analysis for the biomarker data with the functional trajectory outcomes for the ESSF Illustration. This version of the script saves the selection probabilities.
+This script runs the analysis for the biomarker data with the functional trajectory outcomes for the ESS Illustration. This version of the script saves the selection probabilities.
 
-```{r}
-### ************************************************************************** ###
-# Project folders: Stats: '\\duhsnas-pri\dusom_cfa\Private\Statistics\StudiesPro00103483_PRIME KNEE\'
-#                  IRB: ' \\duhsnas-pri\dusom_cfa\Private\IRBStudies\StudiesPro00103483_PRIME KNEE\'
-# File name: 'programs/ESSF Illustration/03_BiomarkerTrajectoriesAnalysis_20260428.Rmd'
-# Author: Marissa Ashner
-# Created date: April 28, 2026
-#
-# Modified dates:  
-#     - 
-#
-#                 
-# Input:  project folder IRB - data/*
-#         
-#         
-# Output: project folder Stats - output/*
-#         
-# 
-### ************************************************************************** ###
-```
-
-
+Note: Without the data, this script will not run on its own. It is shared for the purposes of understanding and utilizing the methods involved with the ESS pipeline.
 
 # Libraries and other setup
 
@@ -58,19 +37,16 @@ library(flextable)
 library(purrr)
 library(stringr)
 library(here)
-
-
-# To render this document: 
-# rmarkdown::render(input = here::here("ESSF Illustration/03_BiomarkerTrajectoriesAnalysis_20260428.Rmd"), output_file = here::here("ESSF Illustration/output/03_BiomarkerTrajectoriesAnalysis_20260428.html"), clean = FALSE)
 ```
 
 # Read in Data 
 
-```{r}
-data = readRDS("//duhsnas-pri/dusom_cfa/Private/IRBstudies/Pro00103483_PRIME KNEE/data/Derived/ESSF Illustration/00_CreateAnalyticDataset_20260428.RDS")
-```
+Data unavailable for public use. The rest of this script is run assuming an analysis dataset called "data" is loaded into the environment.
+
 
 # Center/Scale and Factorize Covariates
+
+Note: For the biomarkers in this dataset, they were centered and scaled before this step.
 
 ```{r}
 # Factor CMVIgG negative
@@ -80,7 +56,8 @@ data$CMVIgG_negative = as.factor(data$CMVIgG_negative)
 # Prep Datasets/ Covariates 
 
 ```{r}
-### Pain Int
+### remove anyone with missing biomakers 
+# select only the biomarkers for the predictor set
 data_ltc_pi = data %>% filter(!is.na(IFNy)) %>% 
   select(subject_id, IFNy:CMVIgG_negative, pi_traj_cont)
 ```
@@ -88,25 +65,39 @@ data_ltc_pi = data %>% filter(!is.na(IFNy)) %>%
 # Pain Interference
 
 ```{r}
-### Create Model Matrix 
+# Create Model Matrix 
 mm_pi <- list(X = data_ltc_pi %>% select(-subject_id, -pi_traj_cont), 
                   y = data_ltc_pi$pi_traj_cont)
 
+## make CMVIgG negative indicator numeric
 mm_pi$X$CMVIgG_negative = as.numeric(mm_pi$X$CMVIgG_negative)-1
+
+# remove predictors that are all zeros in this cohort
 mm_pi$X <- mm_pi$X[, colSums(mm_pi$X != 0) > 0]
 
-  #### Complementary Pairs Stability Selection 
+# Complementary Pairs Stability Selection 
+
+## initialize results
 results_cpss_pi = list()
+
+## loop over the number of active variables
 for(q in seq(5, 25, 5)){
+  # set seed for reproducibility
   set.seed(339580)
-  temp = stabsel(x = mm_pi$X, 
-               y = mm_pi$y, 
-               fitfun = glmnet.lasso, 
-               q = q, 
-               PFER = 2, 
-               B = 100)
+  
+  # run stability selection function
+  temp = stabsel(x = mm_pi$X, # model matrix
+               y = mm_pi$y, # response
+               fitfun = glmnet.lasso, # run LASSO
+               q = q, # number active variables
+               PFER = 2, # error rate; not being used for our purposes; choosing an arbitrary value
+               B = 100 # number of complementary pairs
+               )
+  # grab the selection probabilities 
   results_cpss_pi[[paste0("q", q, "_cpss")]] = temp$max
 }
+
+## combine results
 combined_cpss_pi <- as.data.frame(do.call(cbind, results_cpss_pi))
 
 combined_cpss_pi$predictor = rownames(combined_cpss_pi)
@@ -118,15 +109,17 @@ combined_cpss_pi <- combined_cpss_pi %>%
          q20_cpss_ranked = rank(-q20_cpss) %>% as.integer(),
          q25_cpss_ranked = rank(-q25_cpss) %>% as.integer())
 
-#### Bootstrap LASSO
-#perform k-fold cross-validation to find optimal lambda value
-cv_model <- cv.glmnet(mm_pi$X,
-                      mm_pi$y, 
-                      alpha = 1,
-                      type.measure = "mse",
-                      nfolds = nrow(data_ltc_pi))
+# Bootstrap LASSO
 
-#
+# perform LOO cross-validation on full dataset to find corresponding lambda value for each number of active variables
+cv_model <- cv.glmnet(mm_pi$X, # design matrix
+                      mm_pi$y, # response
+                      alpha = 1, # LASSO
+                      type.measure = "mse", # type of error measure
+                      nfolds = nrow(data_ltc_pi) # LOOCV
+                      )
+
+# pick the lambdas for each number of active variables
 zeros = cv_model$nzero
 lambdas = c(cv_model$lambda[which.max(zeros[zeros <= 5])], 
             cv_model$lambda[which.max(zeros[zeros <= 10])], 
@@ -135,19 +128,29 @@ lambdas = c(cv_model$lambda[which.max(zeros[zeros <= 5])],
             cv_model$lambda[which.max(zeros[zeros <= 25])]
 )
 
+# initialize results list
 results_boot_pi = list(q5_boot = c(), q10_boot = c(), q15_boot = c(), 
                            q20_boot = c(), q25_boot = c())
+
+# Loop over number of resamples
 for(B in 1:200){
+  # set seed each iteration for reproducibility
   set.seed(B*12098)
+  
+  # sample bootstrap indices 
   indices = sample(nrow(data_ltc_pi), 
                    nrow(data_ltc_pi), 
                    replace = TRUE)
   boot_pi_X = mm_pi$X[indices,]
   boot_pi_y = mm_pi$y[indices]
+  
+  # run model on the resample
   final_model = glmnet(boot_pi_X, 
                      boot_pi_y,
                      alpha = 1,
                      lambda = lambdas)
+  
+  # get results for each penalty parameter
   for(i in 1:length(lambdas)){
       results_boot_pi[[i]] = c(results_boot_pi[[i]],rownames(coef(final_model, 
                                             s = lambdas[i]))[coef(final_model, 
@@ -155,6 +158,7 @@ for(B in 1:200){
   }
 }
 
+# organize results
 for(name in names(results_boot_pi)){
   results_boot_pi[[name]] = data.frame(
   table(results_boot_pi[[name]])/200
@@ -171,7 +175,7 @@ combined_boot_pi <- Reduce(function(x,y)
          q20_boot_ranked = rank(-q20_boot, na.last = "keep") %>% as.integer(),
          q25_boot_ranked = rank(-q25_boot, na.last = "keep") %>% as.integer())
 
-#### Combining Results 
+# Combining Results for CPSS and Bootstrap
 combined_cpss_pi$predictor = str_replace_all(combined_cpss_pi$predictor, 
                                              "`", "")
 combined_pi = full_join(combined_cpss_pi, 
@@ -199,13 +203,13 @@ results_sp_pi = data.frame(predictor = names(rowSums_top10_pi_binary),
 # save Top 10s
 
 ```{r}
-saveRDS(results_sp_pi, "//duhsnas-pri/dusom_cfa/Private/IRBstudies/Pro00103483_PRIME KNEE/data/Derived/ESSF Illustration/03_BiomarkerTrajectoryAnalysis_20260428.RDS")
+# saveRDS(results_sp_pi, INSERT PATH NAME)
 ```
 
 # Save model Matrices 
 
 ```{r}
-saveRDS(mm_pi, "//duhsnas-pri/dusom_cfa/Private/IRBstudies/Pro00103483_PRIME KNEE/data/Derived/ESSF Illustration/03_BiomarkerTrajectoryAnalysis_mmpi_20260428.RDS")
+# saveRDS(mm_pi, INSERT PATH NAME)
 ```
 
 
