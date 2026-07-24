@@ -47,3 +47,12 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# extras 
+output/
+00_CreateAnalyticDataset_20260428.Rmd
+01_Table1_20260428.Rmd
+
+
+
+

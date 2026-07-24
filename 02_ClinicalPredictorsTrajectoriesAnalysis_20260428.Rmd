@@ -1,0 +1,376 @@
+---
+title: "Clinical Predictors Trajectories Analysis -- ESS Illustration"
+author: "Marissa Ashner"
+date: "2026-04-28"
+output:  
+  html_document:
+    toc: true
+    toc_float:
+        collapsed: true
+        smooth_scroll: true
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+This script runs the analysis for the clinical predictor data with the Pain Interference trajectory outcomes for the ESS illustration.
+
+Note: Without the data, this script will not run on its own. It is shared for the purposes of understanding and utilizing the methods involved with the ESS pipeline.
+
+# Libraries and other setup
+
+```{r echo = FALSE}
+##### Packages Needed ##### 
+library(dplyr)
+library(caret)
+library(glmnet)
+library(tidyr)
+library(mpath)
+library(readxl)
+library(stabs)
+library(flextable)
+library(purrr)
+library(stringr)
+library(here)
+```
+
+# Read in Data 
+
+Data unavailable for public use. The rest of this script is run assuming an analysis dataset called "data" is loaded into the environment.
+
+# Center/Scale and Factorize Covariates
+
+```{r}
+# Factor CMVIgG negative
+data$CMVIgG_negative = as.factor(data$CMVIgG_negative)
+
+# Center and Scale continuous clinical variables 
+data = data %>% mutate(across(gait_speed:emotional_support_tscore & 
+                                where(is.numeric),
+                              ~ as.numeric(scale(.x))))
+```
+
+# Prep Datasets/ Covariates 
+
+```{r}
+# remove anyone with missing biomakers 
+# select only the clinical predictors for the predictor set
+data_ltc_pi = data %>% filter(!is.na(IFNy)) %>% 
+  select(subject_id, pi_traj_cont, gait_speed:emotional_support_tscore, 
+                                  -spef_diab)
+```
+
+# Make Function for Covariate Matrix 
+
+```{r}
+# function to make the design matrix for the predictors
+# this is written for "standard LASSO" and not "group LASSO", meaning levels of variables will be considered by the penalization method separately and will not be tethered together                                                                                                                            
+make_group_matrix <- function(
+    data, # data frame
+    response, # name of the outcome column
+    # Factors
+    na_as_level = TRUE, # creates a new level for the NAs
+    na_level    = "(Missing)", # what to call the NA level
+    # Numeric preprocessing
+    center = TRUE, # center numeric variables
+    scale  = TRUE, # scale numeric variables 
+    indicator_suffix = "_miss" # suffix for missing indicator variable
+    ) {
+  
+  # check to see if data is a data frame
+  stopifnot(is.data.frame(data))
+  
+  # check to see if the response is provided as a character, length 1, and it's in the data frame
+  stopifnot(is.character(response), length(response) == 1, response %in% names(data))
+
+  # for the continuous missing indicators, we will impute the mean for the numeric portion of the variables
+  impute_numeric <- "mean"
+
+  # Work on a copy
+  df <- data
+
+  # Extract outcome and remove from predictors
+  y <- df[[response]]
+  df[[response]] <- NULL
+
+  # Factors: coerce and (optionally) add explicit missing level
+  for (nm in names(df)) {
+    if (is.character(df[[nm]])) df[[nm]] <- factor(df[[nm]])
+    if (is.factor(df[[nm]]) && isTRUE(na_as_level)) {
+      df[[nm]] <- addNA(df[[nm]])
+      lev <- levels(df[[nm]])
+      lev[is.na(lev)] <- na_level
+      levels(df[[nm]]) <- lev
+    }
+  }
+
+  # Numeric main effects: indicators + impute + center/scale 
+  cont_vars <- names(df)[vapply(df, function(z) is.numeric(z) && !is.factor(z), logical(1))]
+  miss_indicator_cols <- list()
+  preproc <- list(
+    numeric = list(stats = list(),
+                   method = impute_numeric,
+                   center = center,
+                   scale  = scale),
+    factor  = list(na_as_level = na_as_level, na_level = na_level)
+  )
+
+  for (v in cont_vars) {
+    xvec <- df[[v]]
+    # 0/1 missingness indicator (kept even if there are no NAs; it's all zeros then)
+    miss_indicator_cols[[v]] <- as.integer(is.na(xvec))
+
+    # Impute
+    fill <- switch(impute_numeric,
+                   mean   = mean(xvec, na.rm = TRUE),
+                   median = stats::median(xvec, na.rm = TRUE),
+                   zero   = 0)
+    x_imp <- xvec
+    x_imp[is.na(x_imp)] <- fill
+
+    # Center/scale
+    mu  <- if (center) mean(x_imp) else 0
+    sdv <- if (scale)  stats::sd(x_imp) else 1
+    if (isTRUE(scale) && (is.na(sdv) || sdv == 0)) sdv <- 1
+
+    df[[v]] <- if (!center && !scale) x_imp else (x_imp - mu) / sdv
+
+    # Record stats for reproducibility
+    preproc$numeric$stats[[v]] <- list(impute_value = fill, mean = mu, sd = sdv)
+  }
+
+  # Build model matrix
+  tt <- terms(~ ., data = df)
+  mf <- model.frame(tt, data = df, na.action = na.pass)
+
+  X_full <- model.matrix(tt, data = mf)   # includes intercept if any
+  assign_full <- attr(X_full, "assign")   # capture before any subsetting
+  if (is.null(assign_full)) {
+    stop("Internal error: attr(X_full, 'assign') is NULL; model.matrix did not supply 'assign'.")
+  }
+
+  # Drop intercept column and its assign entry if present
+  has_intercept <- isTRUE(attr(tt, "intercept") == 1)
+  if (has_intercept) {
+    # Intercept is column 1 in model.matrix output
+    X0 <- X_full[, -1, drop = FALSE]
+    assign_vec <- assign_full[-1]
+  } else {
+    X0 <- X_full
+    assign_vec <- assign_full
+  }
+  
+  
+  # Term labels (one per model term; often equals unique(assign_vec))
+  term.labels <- attr(tt, "term.labels")
+
+  # Start from base matrix and grouping
+  X     <- X0
+  group <- assign_vec
+  
+    # Append numeric missing indicators, grouped with their main-effect term
+  if (length(miss_indicator_cols)) {
+    for (v in names(miss_indicator_cols)) {
+      # Find the *term id* for this variable in the ~ . design
+      term_id <- match(v, term.labels)
+      if (is.na(term_id)) next  # defensive; should not happen in ~ . design
+
+      ind_name <- paste0(v, indicator_suffix)
+      ind_vec  <- as.numeric(miss_indicator_cols[[v]])
+
+      # Append as a *matrix* column to keep X as matrix
+      ind_mat <- matrix(ind_vec, nrow = nrow(X), ncol = 1,
+                        dimnames = list(NULL, ind_name))
+      X <- cbind(X, ind_mat)
+
+      # Append exactly one group id for the new column
+      group <- c(group, term_id)
+    }
+  }
+  
+    # Ensure unique, clean column names
+  colnames(X) <- make.unique(colnames(X), sep = "_dup")
+
+  # Final integrity checks
+  if (ncol(X) != length(group)) {
+    stop(sprintf("Length mismatch: ncol(X) = %d but length(group) = %d",
+                 ncol(X), length(group)))
+  }
+
+
+  list(X = X, y = y)
+}
+
+
+```
+
+
+
+
+# Pain Interference
+
+```{r}
+# Create Model Matrix 
+mm_pi <- make_group_matrix(
+  data         = data_ltc_pi[,-1], # your data.frame; removed the ID column
+  response  = "pi_traj_cont", # outcome column name in df
+  center = FALSE, # already centered and scaled before subsetting
+  scale = FALSE
+)
+
+## remove any columns with all zeros in this subset of the cohort
+mm_pi$X <- mm_pi$X[, colSums(mm_pi$X != 0) > 0]
+
+
+# Complementary Pairs Stability Selection 
+
+## initialize results 
+results_cpss_pi = list()
+
+## loop over the number of active variables
+for(q in seq(5, 25, 5)){
+  # set seed for reproducibility 
+  set.seed(339580)
+  
+  # run stability selection function
+  temp = stabsel(x = mm_pi$X, # model matrix
+               y = mm_pi$y, # repsonse
+               fitfun = glmnet.lasso, # run LASSO
+               q = q, # number of active variables 
+               PFER = 2, # error rate; not being used for our purposes; choosing an arbitrary value
+               B = 100 # number of complementary pairs
+               )
+  # grab the selection probabilities 
+  results_cpss_pi[[paste0("q", q, "_cpss")]] = temp$max
+}
+
+## combine results  
+combined_cpss_pi <- as.data.frame(do.call(cbind, results_cpss_pi))
+
+combined_cpss_pi$predictor = rownames(combined_cpss_pi)
+
+combined_cpss_pi <- combined_cpss_pi %>%
+  mutate(q5_cpss_ranked = rank(-q5_cpss) %>% as.integer(), 
+         q10_cpss_ranked = rank(-q10_cpss) %>% as.integer(),
+         q15_cpss_ranked = rank(-q15_cpss) %>% as.integer(),
+         q20_cpss_ranked = rank(-q20_cpss) %>% as.integer(),
+         q25_cpss_ranked = rank(-q25_cpss) %>% as.integer())
+
+# Bootstrap LASSO
+
+# perform LOO cross-validation on full dataset to find corresponding lambda value for each number of active variables
+cv_model <- cv.glmnet(mm_pi$X, # design matrix
+                      mm_pi$y, # response
+                      alpha = 1, # LASSO
+                      type.measure = "mse", # type of error measure
+                      nfolds = nrow(data_ltc_pi) # LOOCV
+                      )
+
+# pick the lambdas for each number of active variables 
+zeros = cv_model$nzero
+lambdas = c(cv_model$lambda[which.max(zeros[zeros <= 5])], 
+            cv_model$lambda[which.max(zeros[zeros <= 10])], 
+            cv_model$lambda[which.max(zeros[zeros <= 15])], 
+            cv_model$lambda[which.max(zeros[zeros <= 20])], 
+            cv_model$lambda[which.max(zeros[zeros <= 25])]
+)
+
+# initialize results list
+results_boot_pi = list(q5_boot = c(), q10_boot = c(), q15_boot = c(), 
+                           q20_boot = c(), q25_boot = c())
+
+# Loop over number of resamples
+for(B in 1:200){
+  # set seed each iteration for reproducibility
+  set.seed(B*12098)
+  
+  # sample bootstrap indices 
+  indices = sample(nrow(data_ltc_pi), 
+                   nrow(data_ltc_pi), 
+                   replace = TRUE)
+  boot_pi_X = mm_pi$X[indices,]
+  boot_pi_y = mm_pi$y[indices]
+  
+  # run model on the resample
+  final_model = glmnet(boot_pi_X, 
+                     boot_pi_y,
+                     alpha = 1,
+                     lambda = lambdas)
+  
+  # get results for each penalty parameter
+  for(i in 1:length(lambdas)){
+      results_boot_pi[[i]] =
+        c(results_boot_pi[[i]],
+          rownames(coef(final_model, 
+                        s = lambdas[i]))
+          [coef(final_model, 
+                s = lambdas[i])[, 1] != 0][-1])
+  }
+}
+
+# organize results 
+for(name in names(results_boot_pi)){
+  results_boot_pi[[name]] = data.frame(
+  table(results_boot_pi[[name]])/200
+) %>% arrange(-Freq)
+colnames(results_boot_pi[[name]]) <- c("predictor", name)
+}
+
+combined_boot_pi <- Reduce(function(x,y)
+  full_join(x, y, by = "predictor"), results_boot_pi) %>% 
+    mutate(across(where(is.numeric), ~ replace_na(., 0))) %>% 
+  mutate(q5_boot_ranked = rank(-q5_boot, na.last = "keep") %>% as.integer(), 
+         q10_boot_ranked = rank(-q10_boot, na.last = "keep") %>% as.integer(),
+         q15_boot_ranked = rank(-q15_boot, na.last = "keep") %>% as.integer(),
+         q20_boot_ranked = rank(-q20_boot, na.last = "keep") %>% as.integer(),
+         q25_boot_ranked = rank(-q25_boot, na.last = "keep") %>% as.integer())
+
+# Combining Results for CPSS and Bootstrap 
+combined_pi = full_join(combined_cpss_pi, 
+                            combined_boot_pi, 
+                            by = "predictor")
+combined_pi <- combined_pi %>% 
+    mutate(across(where(is.numeric) & ends_with("ranked"), ~ replace_na(., 30))) %>% 
+   mutate(across(where(is.numeric) & ends_with("boot"), ~ replace_na(., 0)))
+
+top10_pi_binary = combined_pi %>% select(ends_with("ranked")) %>% apply(2, function(x) ifelse(x <= 10, 1, 0))
+rownames(top10_pi_binary) = combined_pi$predictor
+
+rowSums_top10_pi_binary = rowSums(top10_pi_binary) %>% sort(decreasing = TRUE) 
+
+results_sp_pi = data.frame(predictor = names(rowSums_top10_pi_binary), 
+           stabscore = unname(rowSums_top10_pi_binary)) %>% left_join(
+             combined_pi, by = "predictor"
+           ) %>% rowwise %>% mutate(
+    median_sp = median(c_across(matches("^q(5|10|15|20|25)_(cpss|boot)$")))) %>% ungroup() %>% 
+  arrange(-stabscore, -median_sp) %>% 
+  filter(stabscore != 0) %>% 
+  mutate(health_measure = "pi")
+```
+
+
+# save Top 10s
+
+```{r}
+# saveRDS(results_sp_pi, INSERT PATH NAME)
+```
+
+# Save model Matrices 
+
+```{r}
+# saveRDS(mm_pi, INSERT PATH NAME)
+```
+
+
+# Session information
+
+```{r echo = FALSE, results = 'markup'}
+sessionInfo()
+```
+
+
