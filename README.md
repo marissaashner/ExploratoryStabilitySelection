@@ -4,6 +4,8 @@
 
 Software supplement for the manuscript *An Exploratory Stability Selection (ESS) Framework for Robust Predictor Discovery: An Application to Physical Resilience in Aging Populations*
 
+**MEDRXIV Link to the paper:** https://www.medrxiv.org/content/10.64898/2026.08.01.26359469v1
+
 In this repository, you will find the following programs:
 - `02_ClinicalPredictorsTrajectoriesAnalysis_20260428.Rmd`: This script runs the analysis for the clinical predictor set with the pain interference trajectory outcome for the ESS Illustration.
 - `03_BiomarkerTrajectoriesAnalysis_20260428.Rmd`: This script runs the analysis for the biomarker predictor sets with the pain interference trajectory outcome for the ESS Illustration.
